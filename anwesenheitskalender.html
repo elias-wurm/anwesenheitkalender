@@ -6,6 +6,9 @@
 <title>Anwesenheitskalender</title>
 <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600;700&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-firestore-compat.js"></script>
 <style>
   :root {
     --bg: #0f1117;
@@ -369,9 +372,55 @@
     body { padding: 12px; }
     .app-title { font-size: 1.3rem; }
   }
+
+  /* ── Auth Overlay ── */
+  #authOverlay {
+    position: fixed; inset: 0; z-index: 9999;
+    background: var(--bg);
+    display: flex; align-items: center; justify-content: center;
+  }
+  .auth-card {
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 40px 48px;
+    width: 100%; max-width: 420px;
+    display: flex; flex-direction: column; gap: 12px;
+    box-shadow: 0 8px 40px rgba(0,0,0,.45);
+  }
+  .auth-logo { font-size: 1.5rem; font-weight: 700; color: var(--text); margin-bottom: 4px; }
+  .auth-logo span { color: var(--accent); }
+  .auth-subtitle { font-size: 0.85rem; color: var(--muted); margin: 0 0 8px; }
+  .auth-card input {
+    background: var(--bg); border: 1px solid var(--border);
+    color: var(--text); border-radius: var(--radius-sm);
+    padding: 10px 14px; font-size: 0.9rem; outline: none;
+    font-family: inherit; transition: border-color .15s;
+  }
+  .auth-card input:focus { border-color: var(--accent); }
+  .auth-error {
+    color: #f56565; font-size: 0.82rem;
+    padding: 8px 12px; background: rgba(245,101,101,.1);
+    border-radius: var(--radius-sm);
+  }
 </style>
 </head>
 <body>
+
+<!-- Auth Overlay -->
+<div id="authOverlay">
+  <div class="auth-card">
+    <div class="auth-logo">Anwesenheits<span>kalender</span></div>
+    <p class="auth-subtitle">Bitte melde dich mit deiner Firmen-E-Mail an.</p>
+    <input type="email" id="authEmail" placeholder="vorname.nachname@engel.at" autocomplete="username"
+           onkeydown="if(event.key==='Enter')document.getElementById('authPassword').focus()">
+    <input type="password" id="authPassword" placeholder="Passwort" autocomplete="current-password"
+           onkeydown="if(event.key==='Enter')signIn()">
+    <div id="authError" class="auth-error" style="display:none"></div>
+    <button class="btn btn-primary" onclick="signIn()" style="width:100%;justify-content:center">Anmelden</button>
+    <button class="btn" onclick="register()" style="width:100%;justify-content:center;margin-top:2px">Registrieren</button>
+  </div>
+</div>
 
 <div class="app-header">
   <div class="app-title">Anwesenheits<span>kalender</span></div>
@@ -389,6 +438,11 @@
     <button class="btn" onclick="document.getElementById('pdfImportInput').click()">↑ PDF Import</button>
     <input type="file" id="pdfImportInput" accept=".pdf" style="display:none" onchange="importPdf(event)">
     <button class="btn btn-primary" onclick="exportData()">↓ Export</button>
+    <div id="authStatus" style="display:flex;align-items:center;gap:6px;margin-left:8px;">
+      <span id="headerUser" style="font-size:0.75rem;color:var(--muted);max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">⟳ Prüfe Anmeldung…</span>
+      <button class="btn" id="logoutBtn" onclick="signOutUser()" style="display:none;font-size:0.75rem;padding:4px 10px">Abmelden</button>
+      <button class="btn" id="loginBtn" onclick="document.getElementById('authOverlay').style.display='flex'" style="display:none;font-size:0.75rem;padding:4px 10px">Anmelden</button>
+    </div>
   </div>
 </div>
 
@@ -681,7 +735,138 @@ function saveState() {
   localStorage.setItem(STORAGE_KEY, JSON.stringify({
     year: state.year, attrs: state.attrs, days: state.days, activeMonth: state.activeMonth
   }));
+  scheduleFirestoreSave();
 }
+
+// ── Firebase ──
+const FIREBASE_CONFIG = {
+  apiKey:            "AIzaSyDoMvDvSZOp1jutbRzFPVFXRWqK0CWnzI4",
+  authDomain:        "anwesenheitskalender-ed74f.firebaseapp.com",
+  projectId:         "anwesenheitskalender-ed74f",
+  storageBucket:     "anwesenheitskalender-ed74f.firebasestorage.app",
+  messagingSenderId: "872285966231",
+  appId:             "1:872285966231:web:e8b7de1e734119fe8afed2"
+};
+firebase.initializeApp(FIREBASE_CONFIG);
+const auth = firebase.auth();
+const db   = firebase.firestore();
+
+let _currentUser = null;
+let _saveTimer   = null;
+
+function signIn() {
+  const email = document.getElementById('authEmail').value.trim();
+  const pwd   = document.getElementById('authPassword').value;
+  if (!email.endsWith('@engel.at')) { showAuthError('Nur @engel.at-E-Mail-Adressen sind erlaubt.'); return; }
+  document.getElementById('authError').style.display = 'none';
+  auth.signInWithEmailAndPassword(email, pwd)
+    .catch(e => showAuthError(translateAuthError(e.code)));
+}
+
+function register() {
+  const email = document.getElementById('authEmail').value.trim();
+  const pwd   = document.getElementById('authPassword').value;
+  if (!email.endsWith('@engel.at')) { showAuthError('Nur @engel.at-E-Mail-Adressen sind erlaubt.'); return; }
+  if (pwd.length < 6) { showAuthError('Passwort muss mindestens 6 Zeichen haben.'); return; }
+  document.getElementById('authError').style.display = 'none';
+  auth.createUserWithEmailAndPassword(email, pwd)
+    .catch(e => showAuthError(translateAuthError(e.code)));
+}
+
+function signOutUser() {
+  auth.signOut();
+}
+
+function showAuthError(msg) {
+  const el = document.getElementById('authError');
+  el.textContent = msg;
+  el.style.display = 'block';
+}
+
+function translateAuthError(code) {
+  const map = {
+    'auth/user-not-found':       'E-Mail nicht gefunden.',
+    'auth/wrong-password':       'Falsches Passwort.',
+    'auth/invalid-credential':   'E-Mail oder Passwort falsch.',
+    'auth/email-already-in-use': 'Diese E-Mail ist bereits registriert.',
+    'auth/weak-password':        'Passwort zu schwach (min. 6 Zeichen).',
+    'auth/invalid-email':        'Ungültige E-Mail-Adresse.',
+    'auth/too-many-requests':    'Zu viele Versuche. Bitte warte kurz.',
+  };
+  return map[code] || `Fehler: ${code}`;
+}
+
+async function loadFromFirestore(uid) {
+  try {
+    const doc = await db.collection('users').doc(uid).get();
+    if (doc.exists) {
+      const d = doc.data();
+      state.year        = d.year        || 2026;
+      state.attrs       = d.attrs       || JSON.parse(JSON.stringify(DEFAULT_ATTRS));
+      state.activeMonth = d.activeMonth || 0;
+      const rd = d.days || {};
+      state.days = {};
+      for (const k in rd) state.days[k] = migrateDay(rd[k]);
+    } else {
+      // First login: migrate existing localStorage data
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (raw) {
+        try {
+          const s = JSON.parse(raw);
+          state.year        = s.year        || 2026;
+          state.attrs       = s.attrs       || JSON.parse(JSON.stringify(DEFAULT_ATTRS));
+          state.activeMonth = s.activeMonth || 0;
+          const rd = s.days || {};
+          state.days = {};
+          for (const k in rd) state.days[k] = migrateDay(rd[k]);
+          await saveToFirestore(uid);
+        } catch(e) {}
+      }
+    }
+  } catch(e) {
+    console.error('Firestore load error:', e);
+  }
+}
+
+async function saveToFirestore(uid) {
+  try {
+    await db.collection('users').doc(uid).set({
+      year: state.year, attrs: state.attrs, days: state.days, activeMonth: state.activeMonth
+    });
+  } catch(e) {
+    console.error('Firestore save error:', e);
+  }
+}
+
+function scheduleFirestoreSave() {
+  if (!_currentUser) return;
+  clearTimeout(_saveTimer);
+  _saveTimer = setTimeout(() => saveToFirestore(_currentUser.uid), 2000);
+}
+
+auth.onAuthStateChanged(async user => {
+  _currentUser = user;
+  if (user) {
+    if (!user.email.endsWith('@engel.at')) {
+      await auth.signOut();
+      showAuthError('Nur @engel.at-E-Mail-Adressen sind erlaubt.');
+      return;
+    }
+    document.getElementById('authOverlay').style.display = 'none';
+    document.getElementById('headerUser').textContent = user.email;
+    document.getElementById('logoutBtn').style.display = '';
+    document.getElementById('loginBtn').style.display = 'none';
+    await loadFromFirestore(user.uid);
+    initAllWeekends();
+    document.getElementById('yearLabel').textContent = state.year;
+    render();
+  } else {
+    document.getElementById('authOverlay').style.display = 'flex';
+    document.getElementById('headerUser').textContent = 'Nicht angemeldet';
+    document.getElementById('logoutBtn').style.display = 'none';
+    document.getElementById('loginBtn').style.display = '';
+  }
+});
 
 // ── Helpers ──
 const MONTHS_DE = ['Jänner','Februar','März','April','Mai','Juni','Juli','August','September','Oktober','November','Dezember'];
@@ -1893,10 +2078,6 @@ function applyPdfImport() {
   document.getElementById(id).addEventListener('click',function(e){ if(e.target===this) this.classList.remove('open'); });
 });
 
-loadState();
-initAllWeekends();
-document.getElementById('yearLabel').textContent=state.year;
-render();
 </script>
 </body>
 </html>
