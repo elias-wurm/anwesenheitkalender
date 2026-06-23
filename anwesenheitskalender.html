@@ -1317,11 +1317,27 @@ function applyBulk(){
 }
 
 // ── Settings ──
-const COLOR_PRESETS_BG=['#1a3d2e','#0f2d52','#3d2507','#3d0e0e','#2a0048','#1a2540','#1f3040','#2d1f40','#1f2d1a','#401f1f','#0d2020','#201d10'];
-const COLOR_PRESETS_TEXT=['#74c69d','#6fb3f7','#f4a261','#fc8181','#c084fc','#7dd3fc','#86efac','#fde68a','#fca5a5','#d8b4fe','#6ee7b7','#fbcfe8'];
+const COLOR_PRESETS_BG  = ['#1a3d2e','#0f2d52','#3d2507','#3d0e0e','#2a0048','#1a2540','#1f3040','#2d1f40','#1f2d1a','#401f1f','#0d2020','#201d10'];
+const COLOR_PRESETS_TEXT = ['#74c69d','#6fb3f7','#f4a261','#fc8181','#c084fc','#7dd3fc','#86efac','#fde68a','#fca5a5','#d8b4fe','#6ee7b7','#fbcfe8'];
+
+function pickAutoColor() {
+  const usedBg = new Set(state.attrs.map(a => a.color.toLowerCase()));
+  for (let i = 0; i < COLOR_PRESETS_BG.length; i++) {
+    if (!usedBg.has(COLOR_PRESETS_BG[i])) return { color: COLOR_PRESETS_BG[i], textColor: COLOR_PRESETS_TEXT[i] };
+  }
+  const idx = state.attrs.filter(a => !a.builtin).length % COLOR_PRESETS_BG.length;
+  return { color: COLOR_PRESETS_BG[idx], textColor: COLOR_PRESETS_TEXT[idx] };
+}
 
 function openSettings(){
   renderAttrList(); renderColorPresets();
+  const auto = pickAutoColor();
+  document.getElementById('newAttrColor').value = auto.color;
+  document.getElementById('newAttrTextColor').value = auto.textColor;
+  document.querySelectorAll('#colorPresets .color-preset').forEach(el =>
+    el.classList.toggle('selected', el.title === auto.color));
+  document.querySelectorAll('#textColorPresets .color-preset').forEach(el =>
+    el.classList.toggle('selected', el.title === auto.textColor));
   document.getElementById('settingsPdfBackBtn').style.display = (_pdfState && _pdfState._pendingNewAttr) ? '' : 'none';
   document.getElementById('settingsOverlay').classList.add('open');
 }
