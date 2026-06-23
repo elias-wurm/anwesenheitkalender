@@ -584,6 +584,7 @@
       <div style="font-size:0.72rem;color:var(--muted);margin-top:5px;">Wird als Platzhalter verwendet wenn keine Stunden eingetragen sind. Bei Anwesend-Typen ohne Eingabe: 7,9h / 6,9h.</div>
     </div>
     <div class="modal-footer">
+      <button class="btn" id="settingsPdfBackBtn" style="display:none" onclick="pdfMappingNewAttrBack()">← Zurück zur Zuordnung</button>
       <button class="btn" onclick="closeSettings()">Schließen</button>
       <button class="btn btn-primary" onclick="addAttribute()">Hinzufügen</button>
     </div>
@@ -684,6 +685,7 @@
     <div class="attr-list" id="pdfAttrPickerList" style="max-height:55vh;overflow-y:auto;margin-bottom:14px;"></div>
     <div class="modal-footer">
       <button class="btn" onclick="closePdfAttrPicker()">← Zurück</button>
+      <button class="btn btn-primary" onclick="pdfAttrPickerNewAttr()">+ Neues Attribut anlegen</button>
     </div>
   </div>
 </div>
@@ -706,6 +708,7 @@ let state = {
   activeMonth: 0,
   attrs: JSON.parse(JSON.stringify(DEFAULT_ATTRS)),
   days: {},
+  pdfMappings: {},
   bulkMode: false,
   bulkSelected: new Set(),
 };
@@ -726,6 +729,7 @@ function loadState() {
       state.year  = s.year  || 2026;
       state.attrs = s.attrs || JSON.parse(JSON.stringify(DEFAULT_ATTRS));
       state.activeMonth = s.activeMonth || 0;
+      state.pdfMappings = s.pdfMappings || {};
       const rd = s.days || {};
       state.days = {};
       for (const k in rd) state.days[k] = migrateDay(rd[k]);
@@ -735,7 +739,8 @@ function loadState() {
 
 function saveState() {
   localStorage.setItem(STORAGE_KEY, JSON.stringify({
-    year: state.year, attrs: state.attrs, days: state.days, activeMonth: state.activeMonth
+    year: state.year, attrs: state.attrs, days: state.days, activeMonth: state.activeMonth,
+    pdfMappings: state.pdfMappings
   }));
   scheduleFirestoreSave();
 }
@@ -806,6 +811,7 @@ async function loadFromFirestore(uid) {
       state.year        = d.year        || 2026;
       state.attrs       = d.attrs       || JSON.parse(JSON.stringify(DEFAULT_ATTRS));
       state.activeMonth = d.activeMonth || 0;
+      state.pdfMappings = d.pdfMappings || {};
       const rd = d.days || {};
       state.days = {};
       for (const k in rd) state.days[k] = migrateDay(rd[k]);
@@ -833,7 +839,8 @@ async function loadFromFirestore(uid) {
 async function saveToFirestore(uid) {
   try {
     await db.collection('users').doc(uid).set({
-      year: state.year, attrs: state.attrs, days: state.days, activeMonth: state.activeMonth
+      year: state.year, attrs: state.attrs, days: state.days, activeMonth: state.activeMonth,
+      pdfMappings: state.pdfMappings
     });
   } catch(e) {
     console.error('Firestore save error:', e);
@@ -1313,7 +1320,11 @@ function applyBulk(){
 const COLOR_PRESETS_BG=['#1a3d2e','#0f2d52','#3d2507','#3d0e0e','#2a0048','#1a2540','#1f3040','#2d1f40','#1f2d1a','#401f1f','#0d2020','#201d10'];
 const COLOR_PRESETS_TEXT=['#74c69d','#6fb3f7','#f4a261','#fc8181','#c084fc','#7dd3fc','#86efac','#fde68a','#fca5a5','#d8b4fe','#6ee7b7','#fbcfe8'];
 
-function openSettings(){ renderAttrList(); renderColorPresets(); document.getElementById('settingsOverlay').classList.add('open'); }
+function openSettings(){
+  renderAttrList(); renderColorPresets();
+  document.getElementById('settingsPdfBackBtn').style.display = (_pdfState && _pdfState._pendingNewAttr) ? '' : 'none';
+  document.getElementById('settingsOverlay').classList.add('open');
+}
 function closeSettings(){ document.getElementById('settingsOverlay').classList.remove('open'); }
 
 function renderAttrList(){
@@ -1399,8 +1410,10 @@ function addAttribute(){
   saveState(); renderAttrList(); populateBulkSelect(); renderGrid();
   if(_pdfState&&_pdfState._pendingNewAttr){
     _pdfState._pendingNewAttr=false;
-    _pdfState.mappings[_pdfState.current]=id;
+    const t=_pdfState.current;
+    _pdfState.mappings[t]=id;
     _pdfState.queue.shift();
+    savePdfMapping(t,id);
     closeSettings();
     processNextPdfMapping();
     return;
@@ -1818,7 +1831,7 @@ async function importPdf(event) {
       else queue.push(t);
     });
 
-    _pdfState = { ...result, mappings, queue: [...queue], current: null, _pendingNewAttr: false };
+    _pdfState = { ...result, mappings, queue: [...queue], current: null, _pendingNewAttr: false, _pendingNewAttrFrom: null };
     processNextPdfMapping();
 
   } catch (err) {
@@ -1945,11 +1958,8 @@ function parsePdfLines(lines) {
 
     if (codeM) {
       const codeName = codeM[2].trim();
-      if (isAtHoliday(codeName) || /feiertag|glauben/i.test(codeName)) {
-        typeName = '__feiertag__'; holidayName = codeName;
-      } else {
-        typeName = codeName;
-      }
+      typeName = codeName;
+      if (isAtHoliday(codeName) || /feiertag|glauben/i.test(codeName)) holidayName = codeName;
     } else if (timeM) {
       typeName = '__normal__';
       // Ist = 2nd decimal number after removing all HH:MM tokens
@@ -1959,29 +1969,23 @@ function parsePdfLines(lines) {
       else if (nums.length === 1) istHours = parseFloat(nums[0].replace(',', '.'));
     } else if (textM) {
       const txtName = textM[1].trim();
-      if (isAtHoliday(txtName)) {
-        typeName = '__feiertag__'; holidayName = txtName;
-      } else {
-        typeName = txtName;
-      }
+      typeName = txtName;
+      if (isAtHoliday(txtName)) holidayName = txtName;
     } else {
       // Fallback: text without trailing number (e.g. "Sonderurlaub" with no hours on this line)
       const textOnly = r.match(/^(\d?\.?[A-Za-zäöüÄÖÜß][A-Za-zäöüÄÖÜß0-9\/\.\-\(\) ]+)/);
       if (textOnly) {
         const txtName = textOnly[1].trim();
-        if (isAtHoliday(txtName)) {
-          typeName = '__feiertag__'; holidayName = txtName;
-        } else {
-          typeName = txtName;
-        }
+        typeName = txtName;
+        if (isAtHoliday(txtName)) holidayName = txtName;
+      } else if (year) {
+        // No text at all — try to identify by date (e.g. 24.12 with just Soll numbers)
+        const hols = getAustrianHolidays(year);
+        const found = hols.find(h => dateKey(year, h.month, h.day) === key);
+        typeName = found ? found.name : '(Kein Eintrag)';
+        if (found) holidayName = found.name;
       } else {
-        // No text at all (e.g. 24.12 / Heilig Abend with just Soll numbers) → holiday
-        typeName = '__feiertag__';
-        if (year) {
-          const hols = getAustrianHolidays(year);
-          const found = hols.find(h => dateKey(year, h.month, h.day) === key);
-          if (found) holidayName = found.name;
-        }
+        typeName = '(Kein Eintrag)';
       }
     }
 
@@ -1991,23 +1995,26 @@ function parsePdfLines(lines) {
 }
 
 function autoMatchPdfType(typeName) {
-  if (typeName === '__feiertag__')
-    return state.attrs.find(a => a.id === 'feiertag' || /feiertag/i.test(a.label)) || null;
+  // BA leer + Ist-Zeit vorhanden → immer Anwesend, kein Dialog
   if (typeName === '__normal__')
     return state.attrs.find(a => a.id === 'anwesend') ||
            state.attrs.find(a => a.type === 'anwesend' && !a.countHO) || null;
-  const name = typeName.toLowerCase();
-  // 1. Exact label match first (prevents "Sonderurlaub" from matching "Urlaub")
-  const exact = state.attrs.find(a => a.label.toLowerCase() === name);
-  if (exact) return exact;
-  // 2. Keyword fuzzy match — attr label must be a prefix of typeName to avoid over-matching
-  return state.attrs.find(a => {
-    const l = a.label.toLowerCase();
-    return (/urlaub/.test(name) && /urlaub/.test(l) && name.startsWith(l))
-        || (/zeitausgleich/.test(name) && /zeitausgleich/.test(l))
-        || (/krankenstand/.test(name) && /krankenstand/.test(l))
-        || (/einarbeit/.test(name) && /einarbeit/.test(l));
-  }) || null;
+  // Gespeichertes Mapping aus früheren Importen
+  const savedId = (state.pdfMappings || {})[typeName];
+  if (savedId === '__skip__') return { id: '__skip__' };
+  if (savedId) {
+    const saved = state.attrs.find(a => a.id === savedId);
+    if (saved) return saved;
+    delete state.pdfMappings[typeName]; // Attribut wurde gelöscht → neu fragen
+  }
+  // 100% exakter Label-Match (Groß-/Kleinschreibung egal)
+  return state.attrs.find(a => a.label.toLowerCase() === typeName.toLowerCase()) || null;
+}
+
+function savePdfMapping(typeName, attrId) {
+  if (!state.pdfMappings) state.pdfMappings = {};
+  state.pdfMappings[typeName] = attrId;
+  saveState();
 }
 
 // ── Mapping-Dialog ──
@@ -2024,8 +2031,10 @@ function processNextPdfMapping() {
 
 function pdfMappingSkip() {
   if (!_pdfState) return;
-  _pdfState.mappings[_pdfState.current] = '__skip__';
+  const t = _pdfState.current;
+  _pdfState.mappings[t] = '__skip__';
   _pdfState.queue.shift();
+  savePdfMapping(t, '__skip__');
   document.getElementById('pdfMappingOverlay').classList.remove('open');
   processNextPdfMapping();
 }
@@ -2050,8 +2059,10 @@ function renderPdfAttrPickerList() {
       <div class="attr-name" style="color:${a.textColor}">${a.label}</div>
       <div class="attr-type">${a.type==='anwesend'?'✅ Anwesend':a.type==='abwesend'?'❌ Abwesend':'⬜ Neutral'}</div>`;
     row.onclick = () => {
-      _pdfState.mappings[_pdfState.current] = a.id;
+      const t = _pdfState.current;
+      _pdfState.mappings[t] = a.id;
       _pdfState.queue.shift();
+      savePdfMapping(t, a.id);
       document.getElementById('pdfAttrPickerOverlay').classList.remove('open');
       processNextPdfMapping();
     };
@@ -2067,10 +2078,29 @@ function closePdfAttrPicker() {
 function pdfMappingNewAttr() {
   document.getElementById('pdfMappingOverlay').classList.remove('open');
   const t = _pdfState.current;
-  document.getElementById('newAttrName').value =
-    (t !== '__normal__' && t !== '__feiertag__') ? t : '';
+  document.getElementById('newAttrName').value = t.startsWith('__') ? '' : t;
   _pdfState._pendingNewAttr = true;
+  _pdfState._pendingNewAttrFrom = 'main';
   openSettings();
+}
+
+function pdfAttrPickerNewAttr() {
+  document.getElementById('pdfAttrPickerOverlay').classList.remove('open');
+  const t = _pdfState.current;
+  document.getElementById('newAttrName').value = t.startsWith('__') ? '' : t;
+  _pdfState._pendingNewAttr = true;
+  _pdfState._pendingNewAttrFrom = 'picker';
+  openSettings();
+}
+
+function pdfMappingNewAttrBack() {
+  _pdfState._pendingNewAttr = false;
+  closeSettings();
+  if (_pdfState._pendingNewAttrFrom === 'picker') {
+    document.getElementById('pdfAttrPickerOverlay').classList.add('open');
+  } else {
+    document.getElementById('pdfMappingOverlay').classList.add('open');
+  }
 }
 
 // ── Import anwenden ──
