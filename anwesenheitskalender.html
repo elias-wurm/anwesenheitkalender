@@ -1934,7 +1934,7 @@ function parsePdfLines(lines) {
 
     const key = dateKey(year, parseInt(monS), parseInt(dayS));
     const r = rest.trim();
-    let typeName = '__normal__', istHours = 0;
+    let typeName = '__normal__', istHours = 0, holidayName = null;
 
     // 4-digit BA code: "0040 Urlaub ...", "0130 Schule (Lehrlinge) ..."
     const codeM = r.match(/^(\d{4})\s+([A-Za-zäöüÄÖÜß\/\-\(\) ]+?)(?:\s+\d{2}:\d{2}|\s+[\d,]+|$)/);
@@ -1945,9 +1945,11 @@ function parsePdfLines(lines) {
 
     if (codeM) {
       const codeName = codeM[2].trim();
-      // BA codes that are holidays → normalise to __feiertag__
-      typeName = (isAtHoliday(codeName) || /feiertag|glauben/i.test(codeName))
-        ? '__feiertag__' : codeName;
+      if (isAtHoliday(codeName) || /feiertag|glauben/i.test(codeName)) {
+        typeName = '__feiertag__'; holidayName = codeName;
+      } else {
+        typeName = codeName;
+      }
     } else if (timeM) {
       typeName = '__normal__';
       // Ist = 2nd decimal number after removing all HH:MM tokens
@@ -1957,14 +1959,33 @@ function parsePdfLines(lines) {
       else if (nums.length === 1) istHours = parseFloat(nums[0].replace(',', '.'));
     } else if (textM) {
       const txtName = textM[1].trim();
-      // Known Austrian holiday → __feiertag__; unknown text → separate mapping type
-      typeName = isAtHoliday(txtName) ? '__feiertag__' : txtName;
+      if (isAtHoliday(txtName)) {
+        typeName = '__feiertag__'; holidayName = txtName;
+      } else {
+        typeName = txtName;
+      }
     } else {
-      // No text, no time (e.g. 24.12 / Heilig Abend with just Soll numbers)
-      typeName = '__feiertag__';
+      // Fallback: text without trailing number (e.g. "Sonderurlaub" with no hours on this line)
+      const textOnly = r.match(/^(\d?\.?[A-Za-zäöüÄÖÜß][A-Za-zäöüÄÖÜß0-9\/\.\-\(\) ]+)/);
+      if (textOnly) {
+        const txtName = textOnly[1].trim();
+        if (isAtHoliday(txtName)) {
+          typeName = '__feiertag__'; holidayName = txtName;
+        } else {
+          typeName = txtName;
+        }
+      } else {
+        // No text at all (e.g. 24.12 / Heilig Abend with just Soll numbers) → holiday
+        typeName = '__feiertag__';
+        if (year) {
+          const hols = getAustrianHolidays(year);
+          const found = hols.find(h => dateKey(year, h.month, h.day) === key);
+          if (found) holidayName = found.name;
+        }
+      }
     }
 
-    entries.push({ key, typeName, istHours });
+    entries.push({ key, typeName, istHours, holidayName });
   }
   return { year, entries };
 }
@@ -1976,13 +1997,16 @@ function autoMatchPdfType(typeName) {
     return state.attrs.find(a => a.id === 'anwesend') ||
            state.attrs.find(a => a.type === 'anwesend' && !a.countHO) || null;
   const name = typeName.toLowerCase();
+  // 1. Exact label match first (prevents "Sonderurlaub" from matching "Urlaub")
+  const exact = state.attrs.find(a => a.label.toLowerCase() === name);
+  if (exact) return exact;
+  // 2. Keyword fuzzy match — attr label must be a prefix of typeName to avoid over-matching
   return state.attrs.find(a => {
     const l = a.label.toLowerCase();
-    return l === name
-      || (/urlaub/.test(name) && /urlaub/.test(l))
-      || (/zeitausgleich/.test(name) && /zeitausgleich/.test(l))
-      || (/krankenstand/.test(name) && /krankenstand/.test(l))
-      || (/einarbeit/.test(name) && /einarbeit/.test(l));
+    return (/urlaub/.test(name) && /urlaub/.test(l) && name.startsWith(l))
+        || (/zeitausgleich/.test(name) && /zeitausgleich/.test(l))
+        || (/krankenstand/.test(name) && /krankenstand/.test(l))
+        || (/einarbeit/.test(name) && /einarbeit/.test(l));
   }) || null;
 }
 
@@ -2060,13 +2084,24 @@ function applyPdfImport() {
   state.year = year; initAllWeekends(); state.year = prevYear;
 
   let applied = 0, skipped = 0;
-  entries.forEach(({ key, typeName, istHours }) => {
+  entries.forEach(({ key, typeName, istHours, holidayName }) => {
     const attrId = mappings[typeName];
     if (!attrId || attrId === '__skip__') { skipped++; return; }
     if (!state.days[key]) state.days[key] = { entries: [], note: '' };
     // Keep wochenende-entries, replace work entries
     const weEntries = state.days[key].entries.filter(e => e.attrId === 'wochenende');
-    state.days[key].entries = [...weEntries, { attrId, hours: istHours }];
+    // Auto-fill hours when PDF has no Ist-Zeit (leave, holidays, etc.)
+    let hours = istHours;
+    if (hours === 0) {
+      const [y, mo, d] = key.split('-').map(Number);
+      const wd = weekday(y, mo, d); // 0=Mo … 4=Fr
+      hours = wd === 4 ? 6.9 : 7.9;
+    }
+    state.days[key].entries = [...weEntries, { attrId, hours }];
+    // Write holiday name as day note (only if no note exists yet)
+    if (holidayName && !state.days[key].note) {
+      state.days[key].note = holidayName;
+    }
     applied++;
   });
 
