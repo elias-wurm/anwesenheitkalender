@@ -1965,35 +1965,39 @@ function parsePdfLines(lines) {
     const r = rest.trim();
     let typeName = '__normal__', istHours = 0, holidayName = null;
 
+    // Parses IST hours: removes HH:MM tokens, takes 2nd decimal number (= Ist), or 1st if only one
+    const parseIst = str => {
+      const after = str.replace(/\d{2}:\d{2}\s*/g, '');
+      const nums = after.match(/\d+[,]\d+/g) || [];
+      if (nums.length >= 2) return parseFloat(nums[1].replace(',', '.'));
+      if (nums.length === 1) return parseFloat(nums[0].replace(',', '.'));
+      return 0;
+    };
+
     // 4-digit BA code: "0040 Urlaub ...", "0130 Schule (Lehrlinge) ..."
     const codeM = r.match(/^(\d{4})\s+([A-Za-zäöüÄÖÜß\/\-\(\) ]+?)(?:\s+\d{2}:\d{2}|\s+[\d,]+|$)/);
     // Regular workday: starts with HH:MM
     const timeM = r.match(/^(\d{2}:\d{2})/);
-    // Named text before numbers — catches "Allerheiligen 6,90...", "1.Weihnachtstag 7,90...", "Schule (Lehrlinge) 7,90..."
+    // Named text before numbers — catches "Allerheiligen 6,90...", "1.Weihnachtstag 7,90...", "Home Office 07:45 ..."
     const textM = r.match(/^(\d?\.?[A-Za-zäöüÄÖÜß][A-Za-zäöüÄÖÜß0-9\/\.\-\(\) ]*?)\s+[\d,]/);
 
     if (codeM) {
-      const codeName = codeM[2].trim();
-      typeName = codeName;
-      if (isAtHoliday(codeName) || /feiertag|glauben/i.test(codeName)) holidayName = codeName;
+      typeName = codeM[2].trim();
+      if (isAtHoliday(typeName) || /feiertag|glauben/i.test(typeName)) holidayName = typeName;
+      istHours = parseIst(r);
     } else if (timeM) {
       typeName = '__normal__';
-      // Ist = 2nd decimal number after removing all HH:MM tokens
-      const afterTimes = r.replace(/\d{2}:\d{2}\s*/g, '');
-      const nums = afterTimes.match(/\d+[,]\d+/g) || [];
-      if (nums.length >= 2) istHours = parseFloat(nums[1].replace(',', '.'));
-      else if (nums.length === 1) istHours = parseFloat(nums[0].replace(',', '.'));
+      istHours = parseIst(r);
     } else if (textM) {
-      const txtName = textM[1].trim();
-      typeName = txtName;
-      if (isAtHoliday(txtName)) holidayName = txtName;
+      typeName = textM[1].trim();
+      if (isAtHoliday(typeName)) holidayName = typeName;
+      istHours = parseIst(r);
     } else {
       // Fallback: text without trailing number (e.g. "Sonderurlaub" with no hours on this line)
       const textOnly = r.match(/^(\d?\.?[A-Za-zäöüÄÖÜß][A-Za-zäöüÄÖÜß0-9\/\.\-\(\) ]+)/);
       if (textOnly) {
-        const txtName = textOnly[1].trim();
-        typeName = txtName;
-        if (isAtHoliday(txtName)) holidayName = txtName;
+        typeName = textOnly[1].trim();
+        if (isAtHoliday(typeName)) holidayName = typeName;
       } else if (year) {
         // No text at all — try to identify by date (e.g. 24.12 with just Soll numbers)
         const hols = getAustrianHolidays(year);
@@ -2003,6 +2007,7 @@ function parsePdfLines(lines) {
       } else {
         typeName = '(Kein Eintrag)';
       }
+      istHours = parseIst(r);
     }
 
     entries.push({ key, typeName, istHours, holidayName });
