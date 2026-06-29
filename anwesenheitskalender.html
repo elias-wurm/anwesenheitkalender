@@ -1954,10 +1954,35 @@ function parsePdfLines(lines) {
 
   const entries = [];
   const DAY = /^(MO|DI|MI|DO|FR|SA|SO),?\s*(\d{1,2})\.(\d{2})\s+GF00\s+(GF01|GF02|FREI)(.*)/i;
+  // Continuation line: "0520 Home Office 14:30 17:00" — BA code + name + two times
+  const CONT_BA = /^(\d{4})[\s\xa0]+([A-Za-zäöüÄÖÜß\/\-\(\) ]+?)\s+(\d{2}:\d{2})\s+(\d{2}:\d{2})/;
 
+  // IST hours: strip HH:MM tokens, take 2nd decimal number (Ist), or 1st if only one
+  const parseIst = str => {
+    const after = str.replace(/\d{2}:\d{2}\s*/g, '');
+    const nums = after.match(/\d+[,]\d+/g) || [];
+    if (nums.length >= 2) return parseFloat(nums[1].replace(',', '.'));
+    if (nums.length === 1) return parseFloat(nums[0].replace(',', '.'));
+    return 0;
+  };
+
+  // Duration in hours between two HH:MM strings
+  const timeDiff = (a, b) => {
+    const [ah, am] = a.split(':').map(Number);
+    const [bh, bm] = b.split(':').map(Number);
+    return Math.round(((bh * 60 + bm) - (ah * 60 + am)) / 60 * 100) / 100;
+  };
+
+  // Group: each DAY line + all following non-DAY lines (continuations)
+  const groups = [];
+  let cur = null;
   for (const line of lines) {
     const m = line.trim().match(DAY);
-    if (!m) continue;
+    if (m) { cur = { m, conts: [] }; groups.push(cur); }
+    else if (cur) cur.conts.push(line.trim());
+  }
+
+  for (const { m, conts } of groups) {
     const [,, dayS, monS, tgap, rest] = m;
     if (tgap === 'FREI' || !year) continue;
 
@@ -1965,20 +1990,11 @@ function parsePdfLines(lines) {
     const r = rest.trim();
     let typeName = '__normal__', istHours = 0, holidayName = null;
 
-    // Parses IST hours: removes HH:MM tokens, takes 2nd decimal number (= Ist), or 1st if only one
-    const parseIst = str => {
-      const after = str.replace(/\d{2}:\d{2}\s*/g, '');
-      const nums = after.match(/\d+[,]\d+/g) || [];
-      if (nums.length >= 2) return parseFloat(nums[1].replace(',', '.'));
-      if (nums.length === 1) return parseFloat(nums[0].replace(',', '.'));
-      return 0;
-    };
-
-    // 4-digit BA code: "0040 Urlaub ...", "0130 Schule (Lehrlinge) ..."
+    // 4-digit BA code: "0040 Urlaub ...", "0520 Home Office ..."
     const codeM = r.match(/^(\d{4})\s+([A-Za-zäöüÄÖÜß\/\-\(\) ]+?)(?:\s+\d{2}:\d{2}|\s+[\d,]+|$)/);
     // Regular workday: starts with HH:MM
     const timeM = r.match(/^(\d{2}:\d{2})/);
-    // Named text before numbers — catches "Allerheiligen 6,90...", "1.Weihnachtstag 7,90...", "Home Office 07:45 ..."
+    // Named text before numbers: "Allerheiligen 6,90...", "1.Weihnachtstag 7,90..."
     const textM = r.match(/^(\d?\.?[A-Za-zäöüÄÖÜß][A-Za-zäöüÄÖÜß0-9\/\.\-\(\) ]*?)\s+[\d,]/);
 
     if (codeM) {
@@ -1993,13 +2009,11 @@ function parsePdfLines(lines) {
       if (isAtHoliday(typeName)) holidayName = typeName;
       istHours = parseIst(r);
     } else {
-      // Fallback: text without trailing number (e.g. "Sonderurlaub" with no hours on this line)
       const textOnly = r.match(/^(\d?\.?[A-Za-zäöüÄÖÜß][A-Za-zäöüÄÖÜß0-9\/\.\-\(\) ]+)/);
       if (textOnly) {
         typeName = textOnly[1].trim();
         if (isAtHoliday(typeName)) holidayName = typeName;
       } else if (year) {
-        // No text at all — try to identify by date (e.g. 24.12 with just Soll numbers)
         const hols = getAustrianHolidays(year);
         const found = hols.find(h => dateKey(year, h.month, h.day) === key);
         typeName = found ? found.name : '(Kein Eintrag)';
@@ -2010,8 +2024,28 @@ function parsePdfLines(lines) {
       istHours = parseIst(r);
     }
 
-    entries.push({ key, typeName, istHours, holidayName });
+    // Parse continuation lines with BA code + two times → separate entries per day
+    const contEntries = [];
+    let contSum = 0;
+    for (const cont of conts) {
+      const cm = cont.match(CONT_BA);
+      if (!cm) continue;
+      const contName = cm[2].trim();
+      const duration = timeDiff(cm[3], cm[4]);
+      if (duration <= 0) continue;
+      contEntries.push({ key, typeName: contName, istHours: duration, holidayName: null, noAutoFill: true });
+      contSum += duration;
+    }
+
+    // If continuations exist: subtract their hours from main entry
+    const mainFinal = contSum > 0
+      ? Math.max(0, Math.round((istHours - contSum) * 100) / 100)
+      : istHours;
+    // noAutoFill: main had real IST hours, so 0 after subtraction means "all in continuations"
+    entries.push({ key, typeName, istHours: mainFinal, holidayName, noAutoFill: contSum > 0 && istHours > 0 });
+    entries.push(...contEntries);
   }
+
   return { year, entries };
 }
 
@@ -2130,31 +2164,37 @@ function applyPdfImport() {
   if (!_pdfState) return;
   const { entries, year, mappings } = _pdfState;
 
-  // Ensure weekends are set for the imported year
   const prevYear = state.year;
   state.year = year; initAllWeekends(); state.year = prevYear;
 
+  // Group all entries by day key so multi-entry days are applied atomically
+  const byKey = {};
+  entries.forEach(e => { if (!byKey[e.key]) byKey[e.key] = []; byKey[e.key].push(e); });
+
   let applied = 0, skipped = 0;
-  entries.forEach(({ key, typeName, istHours, holidayName }) => {
-    const attrId = mappings[typeName];
-    if (!attrId || attrId === '__skip__') { skipped++; return; }
+  for (const [key, dayEntries] of Object.entries(byKey)) {
+    const workEntries = [];
+    let dayNote = null;
+
+    for (const { typeName, istHours, holidayName, noAutoFill } of dayEntries) {
+      const attrId = mappings[typeName];
+      if (!attrId || attrId === '__skip__') { skipped++; continue; }
+      let hours = istHours;
+      if (hours === 0 && !noAutoFill) {
+        const [y, mo, d] = key.split('-').map(Number);
+        hours = weekday(y, mo, d) === 4 ? 6.9 : 7.9;
+      }
+      workEntries.push({ attrId, hours });
+      if (holidayName && !dayNote) dayNote = holidayName;
+    }
+
+    if (!workEntries.length) continue;
     if (!state.days[key]) state.days[key] = { entries: [], note: '' };
-    // Keep wochenende-entries, replace work entries
     const weEntries = state.days[key].entries.filter(e => e.attrId === 'wochenende');
-    // Auto-fill hours when PDF has no Ist-Zeit (leave, holidays, etc.)
-    let hours = istHours;
-    if (hours === 0) {
-      const [y, mo, d] = key.split('-').map(Number);
-      const wd = weekday(y, mo, d); // 0=Mo … 4=Fr
-      hours = wd === 4 ? 6.9 : 7.9;
-    }
-    state.days[key].entries = [...weEntries, { attrId, hours }];
-    // Write holiday name as day note (only if no note exists yet)
-    if (holidayName && !state.days[key].note) {
-      state.days[key].note = holidayName;
-    }
-    applied++;
-  });
+    state.days[key].entries = [...weEntries, ...workEntries];
+    if (dayNote && !state.days[key].note) state.days[key].note = dayNote;
+    applied += workEntries.length;
+  }
 
   saveState(); renderGrid();
   if (activeTab === 'uebersicht') renderOverview();
