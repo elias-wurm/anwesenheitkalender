@@ -441,6 +441,7 @@
     <input type="file" id="pdfImportInput" accept=".pdf" style="display:none" onchange="importPdf(event)">
     <button class="btn btn-primary" onclick="exportData()">↓ Export</button>
     <div id="authStatus" style="display:flex;align-items:center;gap:6px;margin-left:8px;">
+      <span id="syncStatus" style="display:none;font-size:0.72rem;white-space:nowrap"></span>
       <span id="headerUser" style="font-size:0.75rem;color:var(--muted);max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">⟳ Prüfe Anmeldung…</span>
       <button class="btn" id="logoutBtn" onclick="signOutUser()" style="display:none;font-size:0.75rem;padding:4px 10px">Abmelden</button>
       <button class="btn" id="loginBtn" onclick="document.getElementById('authOverlay').style.display='flex'" style="display:none;font-size:0.75rem;padding:4px 10px">Anmelden</button>
@@ -733,14 +734,29 @@ function loadState() {
       const rd = s.days || {};
       state.days = {};
       for (const k in rd) state.days[k] = migrateDay(rd[k]);
+      return s.updatedAt || 0;
     }
   } catch(e) {}
+  return 0;
 }
+
+function getLocalUpdatedAt() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (raw) return JSON.parse(raw).updatedAt || 0;
+  } catch(e) {}
+  return 0;
+}
+
+// Load local data immediately on boot so the app never starts from empty
+// defaults while waiting on Firebase — this is the safety net if a later
+// Firestore read/write silently fails.
+loadState();
 
 function saveState() {
   localStorage.setItem(STORAGE_KEY, JSON.stringify({
     year: state.year, attrs: state.attrs, days: state.days, activeMonth: state.activeMonth,
-    pdfMappings: state.pdfMappings
+    pdfMappings: state.pdfMappings, updatedAt: Date.now()
   }));
   scheduleFirestoreSave();
 }
@@ -803,11 +819,31 @@ function translateAuthError(code) {
   return map[code] || `Fehler: ${code}`;
 }
 
+let _syncError = false;
+
+function setSyncStatus(text, isError) {
+  const el = document.getElementById('syncStatus');
+  if (!el) return;
+  el.textContent = text;
+  el.style.color = isError ? '#f56565' : 'var(--muted)';
+  el.style.display = text ? '' : 'none';
+}
+
 async function loadFromFirestore(uid) {
   try {
     const doc = await db.collection('users').doc(uid).get();
+    const localUpdatedAt = getLocalUpdatedAt();
     if (doc.exists) {
       const d = doc.data();
+      const remoteUpdatedAt = d.updatedAt || 0;
+      // If this device has newer local edits than what's in Firestore (e.g. a
+      // previous save failed), keep the local data and push it up instead of
+      // silently overwriting the user's work with the stale remote copy.
+      if (localUpdatedAt > remoteUpdatedAt) {
+        loadState();
+        await saveToFirestore(uid);
+        return;
+      }
       state.year        = d.year        || 2026;
       state.attrs       = d.attrs       || JSON.parse(JSON.stringify(DEFAULT_ATTRS));
       state.activeMonth = d.activeMonth || 0;
@@ -815,24 +851,19 @@ async function loadFromFirestore(uid) {
       const rd = d.days || {};
       state.days = {};
       for (const k in rd) state.days[k] = migrateDay(rd[k]);
-    } else {
-      // First login: migrate existing localStorage data
-      const raw = localStorage.getItem(STORAGE_KEY);
-      if (raw) {
-        try {
-          const s = JSON.parse(raw);
-          state.year        = s.year        || 2026;
-          state.attrs       = s.attrs       || JSON.parse(JSON.stringify(DEFAULT_ATTRS));
-          state.activeMonth = s.activeMonth || 0;
-          const rd = s.days || {};
-          state.days = {};
-          for (const k in rd) state.days[k] = migrateDay(rd[k]);
-          await saveToFirestore(uid);
-        } catch(e) {}
-      }
+    } else if (localUpdatedAt > 0) {
+      // First login on this account: migrate existing localStorage data
+      loadState();
+      await saveToFirestore(uid);
     }
+    _syncError = false;
+    setSyncStatus('', false);
   } catch(e) {
     console.error('Firestore load error:', e);
+    // Keep whatever loadState() already put in `state` at boot — don't reset
+    // to empty defaults just because the remote read failed.
+    _syncError = true;
+    setSyncStatus('⚠ Sync fehlgeschlagen — lokal gespeichert', true);
   }
 }
 
@@ -840,18 +871,37 @@ async function saveToFirestore(uid) {
   try {
     await db.collection('users').doc(uid).set({
       year: state.year, attrs: state.attrs, days: state.days, activeMonth: state.activeMonth,
-      pdfMappings: state.pdfMappings
+      pdfMappings: state.pdfMappings, updatedAt: getLocalUpdatedAt() || Date.now()
     });
+    _syncError = false;
+    setSyncStatus('', false);
   } catch(e) {
     console.error('Firestore save error:', e);
+    _syncError = true;
+    setSyncStatus('⚠ Sync fehlgeschlagen — lokal gespeichert', true);
   }
 }
 
 function scheduleFirestoreSave() {
   if (!_currentUser) return;
   clearTimeout(_saveTimer);
-  _saveTimer = setTimeout(() => saveToFirestore(_currentUser.uid), 2000);
+  _saveTimer = setTimeout(() => {
+    _saveTimer = null;
+    if (_currentUser) saveToFirestore(_currentUser.uid);
+  }, 2000);
 }
+
+// Flush any pending debounced Firestore write immediately when the tab is
+// hidden/closed/reloaded, so edits made just before a reload aren't lost.
+function flushFirestoreSave() {
+  if (!_currentUser || !_saveTimer) return;
+  clearTimeout(_saveTimer);
+  _saveTimer = null;
+  saveToFirestore(_currentUser.uid);
+}
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') flushFirestoreSave(); });
+window.addEventListener('pagehide', flushFirestoreSave);
+window.addEventListener('beforeunload', flushFirestoreSave);
 
 auth.onAuthStateChanged(async user => {
   _currentUser = user;
