@@ -1192,8 +1192,9 @@ function renderStats(m) {
   const saldoColor=saldo>=0?'#74c69d':'#fc8181';
   const saldoSign=saldo>=0?'+':'';
   // Noch verfügbare HO-Stunden bis 40%-Limit:
-  // HO wächst Zähler UND Nenner → x = (0.4*N - H) / 0.6
-  const hoRemaining=hoQuotaNenner>0?(0.4*hoQuotaNenner-hoHours)/0.6:null;
+  // Nenner ist Soll-basiert und ändert sich nicht durch HO-Buchungen → jede gebuchte
+  // HO-Stunde reduziert die Restquote 1:1 (kein /0,6-Faktor wie bei variablem Nenner).
+  const hoRemaining=hoQuotaNenner>0?(0.4*hoQuotaNenner-hoHours):null;
   // Durchschnittliche Tageslänge (4× Mo-Do 7,9h + 1× Fr 6,9h) zur Umrechnung Stunden → Arbeitstage
   const AVG_DAY_HOURS=(4*7.9+6.9)/5;
   const hoRemainingDays=hoRemaining===null?null:Math.abs(hoRemaining)/AVG_DAY_HOURS;
