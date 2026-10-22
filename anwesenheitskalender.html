@@ -1113,7 +1113,9 @@ function renderStats(m) {
   const y=state.year, dim=daysInMonth(y,m);
   const counts={};
   state.attrs.forEach(a=>counts[a.id]={days:0,hours:0});
-  let istHours=0, hoHours=0, sollHours=0, saldoIst=0, saldoSoll=0, hoQuotaNenner=0;
+  let istHours=0, sollHours=0, saldoIst=0, saldoSoll=0, hoQuotaNenner=0, hoQuotaZaehler=0;
+  // SAP-Saldo 9115 "Gesamtanwesenheit (m. EA)": Ist-Stunden der Anwesenheitstage + 0,1h EA je Anwesenheitstag
+  const EA_PER_DAY=0.1;
 
   for(let d=1;d<=dim;d++){
     const key=dateKey(y,m,d);
@@ -1125,7 +1127,7 @@ function renderStats(m) {
       // Leerer Arbeitstag: Platzhalter → zählt als Büro im HO-Nenner
       sollHours+=defH;
       istHours+=defH;
-      hoQuotaNenner+=defH;
+      hoQuotaNenner+=defH+EA_PER_DAY;
       saldoIst+=defH;
       saldoSoll+=defH;
     } else {
@@ -1135,10 +1137,14 @@ function renderStats(m) {
       const onlyAbwesend=!hasAnwesend&&!hasNeutral&&hasAbwesend;
 
       if(!hasNeutral) sollHours+=defH;
-      // HO-Nenner: Soll-Stunden des Tages, sobald irgendeine Anwesend/HO-Buchung existiert —
-      // unabhängig von den tatsächlich gebuchten Ist-Stunden (keine Überstunden-/Teilzeit-Verzerrung).
-      // Abwesend-Tage (Urlaub, Krankenstand, ...) reduzieren die Basis, indem sie hier nichts beitragen.
-      if(!hasNeutral && hasAnwesend) hoQuotaNenner+=defH;
+      // HO-Quote wie SAP: Nenner = gebuchte Anwesend-/HO-Ist-Stunden + 0,1h EA je Anwesenheitstag.
+      // Abwesend-Tage (Urlaub, Krankenstand, ZA, Einarbeit ...) tragen nichts bei.
+      const countsForQuota=!hasNeutral && hasAnwesend;
+      if(countsForQuota) hoQuotaNenner+=EA_PER_DAY;
+      // Tag mit HO-Anteil und weiteren Buchungen: SAP rechnet 0,1h weniger HO (EA fällt in den Nicht-HO-Teil)
+      const hasHO=entries.some(e=>{ const a=getAttr(e.attrId); return a&&a.countHO; });
+      const hasNonHO=entries.some(e=>{ const a=getAttr(e.attrId); return a&&!a.countHO; });
+      if(countsForQuota && hasHO && hasNonHO) hoQuotaZaehler-=EA_PER_DAY;
 
       const seenToday=new Set();
       entries.forEach(e=>{
@@ -1148,7 +1154,8 @@ function renderStats(m) {
         if(!seenToday.has(a.id)){ counts[a.id].days++; seenToday.add(a.id); }
         if(a.type==='anwesend'){
           istHours+=h;
-          if(a.countHO) hoHours+=h;
+          if(countsForQuota) hoQuotaNenner+=h;
+          if(a.countHO && countsForQuota) hoQuotaZaehler+=h;
         } else if(a.type==='abwesend'){
           const credited=attrDefaultHours(a,y,m,d);
           istHours+=credited;
@@ -1185,16 +1192,15 @@ function renderStats(m) {
 
   const differenz=istHours-sollHours;
   const saldo=saldoIst-saldoSoll;
-  const hoQuota=hoQuotaNenner>0?(hoHours/hoQuotaNenner*100):0;
+  const hoQuota=hoQuotaNenner>0?(hoQuotaZaehler/hoQuotaNenner*100):0;
   const qClass=hoQuota>40?'over':hoQuota>30?'warn':'ok';
   const diffColor=differenz>=0?'#74c69d':'#fc8181';
   const diffSign=differenz>=0?'+':'';
   const saldoColor=saldo>=0?'#74c69d':'#fc8181';
   const saldoSign=saldo>=0?'+':'';
   // Noch verfügbare HO-Stunden bis 40%-Limit:
-  // Nenner ist Soll-basiert und ändert sich nicht durch HO-Buchungen → jede gebuchte
-  // HO-Stunde reduziert die Restquote 1:1 (kein /0,6-Faktor wie bei variablem Nenner).
-  const hoRemaining=hoQuotaNenner>0?(0.4*hoQuotaNenner-hoHours):null;
+  // Nenner enthält die HO-Stunden selbst: (Z+h)/(N+h) ≤ 0,4 → h ≤ (0,4·N − Z)/0,6
+  const hoRemaining=hoQuotaNenner>0?(0.4*hoQuotaNenner-hoQuotaZaehler)/0.6:null;
   // Durchschnittliche Tageslänge (4× Mo-Do 7,9h + 1× Fr 6,9h) zur Umrechnung Stunden → Arbeitstage
   const AVG_DAY_HOURS=(4*7.9+6.9)/5;
   const hoRemainingDays=hoRemaining===null?null:Math.abs(hoRemaining)/AVG_DAY_HOURS;
@@ -1242,14 +1248,14 @@ function renderStats(m) {
     <div style="display:flex;align-items:center;justify-content:space-between;margin-top:12px;padding-top:10px;border-top:1px solid var(--border);">
       <div>
         <div style="font-size:0.7rem;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:0.4px;">Home Office Quote</div>
-        <div style="font-size:0.67rem;color:var(--muted);margin-top:1px;">${hoHours.toFixed(2)}h HO · ${hoQuotaNenner.toFixed(2)}h Soll-Basis (Anwesend)</div>
+        <div style="font-size:0.67rem;color:var(--muted);margin-top:1px;">${hoQuotaZaehler.toFixed(2)}h HO · ${hoQuotaNenner.toFixed(2)}h Anwesenheit (inkl. EA)</div>
         ${hoRemaining===null?'':hoRemaining>0
           ?`<div style="font-size:0.67rem;color:#74c69d;margin-top:3px;font-weight:600;">noch ${hoRemaining.toFixed(2)}h HO möglich <span style="opacity:0.75;font-weight:400">(≈ ${hoRemainingDays.toFixed(1)} Arbeitstage)</span></div>`
           :`<div style="font-size:0.67rem;color:#fc8181;margin-top:3px;font-weight:600;">${Math.abs(hoRemaining).toFixed(2)}h über 40%-Limit <span style="opacity:0.75;font-weight:400">(≈ ${hoRemainingDays.toFixed(1)} Arbeitstage)</span></div>`
         }
       </div>
       <div style="text-align:right;">
-        <div class="ho-quota ${qClass}">${hoQuota.toFixed(1)}%</div>
+        <div class="ho-quota ${qClass}">${hoQuota.toFixed(2)}%</div>
         ${hoQuota>40?'<div style="font-size:0.65rem;color:#fc8181;font-weight:600;">⚠ Über 40%-Limit</div>':''}
       </div>
     </div>
