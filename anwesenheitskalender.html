@@ -1206,9 +1206,13 @@ function renderStats(m) {
   const saldoColor=saldo>=0?'#74c69d':'#fc8181';
   const saldoSign=saldo>=0?'+':'';
   // Noch verfügbare HO-Stunden bis 40%-Limit:
-  // Nenner enthält die HO-Stunden selbst: (Z+h)/(N+h) ≤ 0,4 → h ≤ (0,4·N − Z)/0,6
-  // Leere Arbeitstage stecken als Platzhalter (Büro) im Nenner, werden aber durch die spätere Buchung ersetzt → nicht doppelt zählen.
-  const hoRemaining=hoQuotaNenner>0?(0.4*(hoQuotaNenner-platzhalterStunden)-hoQuotaZaehler)/0.6:null;
+  // Mit leeren Arbeitstagen: Platzhalter-Stunden stecken schon im Nenner. Wird ein Platzhalter durch gleich lange
+  // HO-Stunden ersetzt, bleibt der Nenner gleich → Restbudget 1:1 = 0,4·N − Z (höchstens die Platzhalter-Stunden).
+  // Ohne Platzhalter oder über dem Limit: Nenner enthält die HO-Stunden selbst: (Z+h)/(N+h) ≤ 0,4 → h = (0,4·N − Z)/0,6
+  const hoBudget=0.4*hoQuotaNenner-hoQuotaZaehler;
+  const hoRemaining=hoQuotaNenner>0
+    ?(platzhalterStunden>0&&hoBudget>=0?Math.min(hoBudget,platzhalterStunden):hoBudget/0.6)
+    :null;
   // Durchschnittliche Tageslänge (4× Mo-Do 7,9h + 1× Fr 6,9h) zur Umrechnung Stunden → Arbeitstage
   const AVG_DAY_HOURS=(4*7.9+6.9)/5;
   const hoRemainingDays=hoRemaining===null?null:Math.abs(hoRemaining)/AVG_DAY_HOURS;
